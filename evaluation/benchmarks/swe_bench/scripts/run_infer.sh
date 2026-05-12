@@ -198,8 +198,14 @@ cmd=(
     --skip-git-repo-check
     --dangerously-bypass-approvals-and-sandbox
     --ephemeral
-    --ignore-user-config        # don't merge user ~/.codex/config.toml
-    --ignore-rules              # don't load user/project .rules files
+    # NOTE: do NOT pass --ignore-user-config — that flag literally says
+    # "skip $CODEX_HOME/config.toml" (per codex --help), which would skip
+    # OUR per-instance config.toml that wires up the nemo-gym provider +
+    # proxy base_url. The flag's name is misleading: it doesn't isolate
+    # against the user's real ~/.codex, it isolates against the CURRENT
+    # CODEX_HOME we set. Since we mktemp a fresh CODEX_HOME per rollout
+    # there's no user config to bleed in anyway.
+    --ignore-rules              # don't load user/project .rules files (different flag)
     --cd "$WORKSPACE_ROOT"
     --output-last-message "$LAST_MSG_FILE"
 )
