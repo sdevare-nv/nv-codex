@@ -125,13 +125,6 @@ cat >"$CONFIG_TOML" <<EOF
 model = "$MODEL_NAME"
 model_provider = "nemo-gym"
 
-# Disable codex's built-in web_search tool. The gym's openai_model server's
-# pydantic schema only accepts FunctionToolParam (\`type: "function"\`), so a
-# web_search entry in the tools array 422s the entire request.
-# The proxy also strips non-function tools as a defensive net, but disabling
-# at source means we don't waste tokens transmitting them in the first place.
-web_search = "disabled"
-
 # Skip AGENTS.md auto-injection. Codex embeds <workspace>/AGENTS.md into the
 # system prompt as a "<INSTRUCTIONS>" block. If the agent creates or edits an
 # AGENTS.md mid-rollout the system prompt shifts on subsequent turns and the
