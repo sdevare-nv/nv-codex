@@ -141,6 +141,55 @@ def _extract_request_tools(request_obj: object) -> list[object]:
     return tools if isinstance(tools, list) else []
 
 
+def _sanitize_request_body(body: bytes) -> bytes:
+    """Drop tools whose `type` isn't `function` from the outgoing request.
+
+    Codex 0.x adds `{"type": "web_search", ...}` and other hosted-tool entries
+    to its tool list. The gym's openai_model server validates request bodies
+    with a strict pydantic schema that only accepts FunctionToolParam (`type:
+    "function"`), so the whole request 422s when a non-function tool is
+    present.
+
+    We parse the JSON, strip any tool whose `type` is set and not `function`,
+    and re-serialize. Returns the original body if it isn't valid JSON or
+    doesn't have a tools list — this keeps the proxy resilient to wire-format
+    variations.
+    """
+    if not body:
+        return body
+    try:
+        obj = json.loads(body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return body
+    if not isinstance(obj, dict):
+        return body
+    tools = obj.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return body
+
+    cleaned: list[object] = []
+    dropped: list[str] = []
+    for t in tools:
+        if isinstance(t, dict):
+            t_type = t.get("type")
+            # Keep tools with type == "function" OR no type set (some wire
+            # variants leave `type` implicit for the OpenAI Chat path).
+            if t_type is None or t_type == "function":
+                cleaned.append(t)
+                continue
+            dropped.append(str(t_type))
+        else:
+            cleaned.append(t)
+
+    if len(cleaned) == len(tools):
+        return body  # nothing to strip — keep original bytes
+
+    obj["tools"] = cleaned
+    if dropped:
+        sys.stderr.write(f"[proxy] stripped non-function tools: {dropped}\n")
+    return json.dumps(obj).encode("utf-8")
+
+
 def make_handler(state: ProxyState):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -215,6 +264,14 @@ def make_handler(state: ProxyState):
             headers_lower = {k.lower(): v for k, v in self.headers.items()}
             session_id = _pick_session_id(headers_lower)
             parent_session_id = _pick_parent_session_id(headers_lower)
+
+            # Sanitize the outgoing payload. Codex injects built-in tools whose
+            # `type` is not `"function"` (e.g. `web_search`, hosted tools); the
+            # gym's openai_model server's pydantic schema only accepts
+            # FunctionToolParam and 422s the whole request when it sees any
+            # other type. Drop those before forwarding so the request validates.
+            if any(p in self.path for p in ("/chat/completions", "/responses")):
+                body = _sanitize_request_body(body)
 
             status, resp_headers, resp_body = self._forward(body)
 

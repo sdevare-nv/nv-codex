@@ -125,6 +125,27 @@ cat >"$CONFIG_TOML" <<EOF
 model = "$MODEL_NAME"
 model_provider = "nemo-gym"
 
+# Disable codex's built-in web_search tool. The gym's openai_model server's
+# pydantic schema only accepts FunctionToolParam (\`type: "function"\`), so a
+# web_search entry in the tools array 422s the entire request.
+# The proxy also strips non-function tools as a defensive net, but disabling
+# at source means we don't waste tokens transmitting them in the first place.
+web_search = "disabled"
+
+# Skip AGENTS.md auto-injection. Codex embeds <workspace>/AGENTS.md into the
+# system prompt as a "<INSTRUCTIONS>" block. If the agent creates or edits an
+# AGENTS.md mid-rollout the system prompt shifts on subsequent turns and the
+# RL prompt-token-prefix invariant breaks.
+project_doc_max_bytes = 0
+
+# Push auto-compaction out of reach. Codex auto-summarizes when token usage
+# nears \`model_auto_compact_token_limit\`; that injects a synthetic summary
+# message and drops prior turns, which also breaks the prefix invariant.
+# Setting both to a value larger than any plausible rollout context keeps the
+# code path dormant.
+model_context_window = 1000000
+model_auto_compact_token_limit = 1000000
+
 [model_providers.nemo-gym]
 name = "nemo-gym"
 base_url = "http://127.0.0.1:${PROXY_PORT}/v1"
@@ -155,6 +176,8 @@ cmd=(
     --skip-git-repo-check
     --dangerously-bypass-approvals-and-sandbox
     --ephemeral
+    --ignore-user-config        # don't merge user ~/.codex/config.toml
+    --ignore-rules              # don't load user/project .rules files
     --cd "$WORKSPACE_ROOT"
     --output-last-message "$LAST_MSG_FILE"
 )
