@@ -71,11 +71,31 @@ mkdir -p "$RUN_DIR" "$COMPLETIONS_DIR"
 CODEX_HOME_DIR="$(mktemp -d -t codex-home.XXXXXX)"
 export CODEX_HOME="$CODEX_HOME_DIR"
 
+# Resolve a Python 3 interpreter. After `conda activate testbed` the env's
+# binary is just `python` (no `3` suffix), and some SIFs ship only `python` or
+# only `python3`. Probe in order: PATH-resolved python3 → python → known
+# conda paths → minimal-image candidates.
+PYTHON_BIN=""
+for cand in python3 python /opt/miniconda3/envs/testbed/bin/python /opt/miniconda3/bin/python /usr/bin/python3 /usr/bin/python; do
+    if command -v "$cand" >/dev/null 2>&1 || [ -x "$cand" ]; then
+        # Sanity check: must be Python 3.
+        if "$cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3,7) else 1)' 2>/dev/null; then
+            PYTHON_BIN="$cand"
+            break
+        fi
+    fi
+done
+if [ -z "$PYTHON_BIN" ]; then
+    echo "ERROR: no Python 3 interpreter found on PATH or in conda paths" >&2
+    exit 72
+fi
+echo "Using PYTHON_BIN=$PYTHON_BIN ($("$PYTHON_BIN" --version 2>&1))"
+
 # Start the sidecar proxy. It listens on a free localhost port, mirrors each
 # request/response to disk in openhands-compatible llm_completions JSONs, then
 # forwards to NEMO_GYM_MODEL_SERVER_BASE_URL.
 PROXY_LOG="$RUN_DIR/nemo_gym_proxy.log"
-PROXY_PORT=$(python3 - <<'PY'
+PROXY_PORT=$("$PYTHON_BIN" - <<'PY'
 import socket
 s = socket.socket()
 s.bind(("127.0.0.1", 0))
@@ -84,7 +104,7 @@ s.close()
 PY
 )
 echo "Starting sidecar proxy on 127.0.0.1:$PROXY_PORT -> $NEMO_GYM_MODEL_SERVER_BASE_URL"
-python3 "$PROXY_SCRIPT" \
+"$PYTHON_BIN" "$PROXY_SCRIPT" \
     --listen-port "$PROXY_PORT" \
     --upstream-url "$NEMO_GYM_MODEL_SERVER_BASE_URL" \
     --completions-dir "$COMPLETIONS_DIR" \
@@ -100,7 +120,7 @@ for i in $(seq 1 50); do
         tail -20 "$PROXY_LOG" >&2 || true
         exit 71
     fi
-    if python3 -c "import socket,sys; s=socket.socket(); s.settimeout(0.2); s.connect(('127.0.0.1',$PROXY_PORT)); s.close()" 2>/dev/null; then
+    if "$PYTHON_BIN" -c "import socket,sys; s=socket.socket(); s.settimeout(0.2); s.connect(('127.0.0.1',$PROXY_PORT)); s.close()" 2>/dev/null; then
         echo "Proxy ready after ${i}*0.2s"
         break
     fi
@@ -200,7 +220,7 @@ if [ "$CODEX_EXIT" -ne 0 ]; then
     ERROR_FIELD="\"codex_exit_${CODEX_EXIT}\""
 fi
 OUTPUT_JSONL="$RUN_DIR/output.jsonl"
-python3 - <<PY > "$OUTPUT_JSONL"
+"$PYTHON_BIN" - <<PY > "$OUTPUT_JSONL"
 import json
 with open("$PATCH_FILE") as f:
     patch = f.read()
