@@ -230,25 +230,38 @@ GIT_PAGER=cat git -C "$WORKSPACE_ROOT" diff > "$PATCH_FILE" 2>/dev/null || echo 
 PATCH_BYTES=$(stat -c '%s' "$PATCH_FILE" 2>/dev/null || echo 0)
 
 # Write output.jsonl in the openhands-compatible shape.
-ERROR_FIELD="null"
-if [ "$CODEX_EXIT" -ne 0 ]; then
-    ERROR_FIELD="\"codex_exit_${CODEX_EXIT}\""
-fi
+# Pass the codex exit code through the environment instead of bash-substituting
+# Python literals — the previous form interpolated "null" / "\"codex_exit_N\""
+# directly into the Python source, which crashed (`NameError: name 'null' is
+# not defined`) because Python uses None, not null.
 OUTPUT_JSONL="$RUN_DIR/output.jsonl"
-"$PYTHON_BIN" - <<PY > "$OUTPUT_JSONL"
-import json
-with open("$PATCH_FILE") as f:
+SELECTED_ID="$SELECTED_ID" \
+MODEL_NAME="$MODEL_NAME" \
+PATCH_FILE="$PATCH_FILE" \
+CODEX_EXIT="$CODEX_EXIT" \
+"$PYTHON_BIN" - >"$OUTPUT_JSONL" <<'PY'
+import json, os
+selected_id = os.environ["SELECTED_ID"]
+model_name = os.environ["MODEL_NAME"]
+patch_file = os.environ["PATCH_FILE"]
+codex_exit = int(os.environ["CODEX_EXIT"])
+with open(patch_file) as f:
     patch = f.read()
 print(json.dumps({
-    "instance_id": "$SELECTED_ID",
+    "instance_id": selected_id,
     "test_result": {"git_patch": patch},
-    "metadata": {"llm_config": {"model": "$MODEL_NAME"}},
-    "metrics": {"codex_exit_code": $CODEX_EXIT},
-    "error": $ERROR_FIELD,
+    "metadata": {"llm_config": {"model": model_name}},
+    "metrics": {"codex_exit_code": codex_exit},
+    "error": None if codex_exit == 0 else f"codex_exit_{codex_exit}",
 }))
 PY
 
-echo "[bench] wrote $OUTPUT_JSONL (patch=$PATCH_BYTES bytes, error=$ERROR_FIELD)"
+if [ "$CODEX_EXIT" -eq 0 ]; then
+    err_msg="none"
+else
+    err_msg="codex_exit_${CODEX_EXIT}"
+fi
+echo "[bench] wrote $OUTPUT_JSONL (patch=$PATCH_BYTES bytes, error=$err_msg)"
 
 # Always exit 0 — partial patches + error field are useful signals.
 exit 0
