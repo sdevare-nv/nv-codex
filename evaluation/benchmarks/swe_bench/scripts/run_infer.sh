@@ -71,12 +71,21 @@ mkdir -p "$RUN_DIR" "$COMPLETIONS_DIR"
 CODEX_HOME_DIR="$(mktemp -d -t codex-home.XXXXXX)"
 export CODEX_HOME="$CODEX_HOME_DIR"
 
-# Resolve a Python 3 interpreter. After `conda activate testbed` the env's
-# binary is just `python` (no `3` suffix), and some SIFs ship only `python` or
-# only `python3`. Probe in order: PATH-resolved python3 → python → known
-# conda paths → minimal-image candidates.
+# Resolve a Python 3 interpreter for the sidecar proxy. Probe in order:
+#   1. The bundled python-build-standalone interpreter staged alongside codex
+#      itself. Setup script downloads it; self-contained, runs on any SIF.
+#   2. PATH-resolved python3 / python — works after `conda activate testbed`.
+#   3. Known conda + system paths — last-ditch fallbacks.
 PYTHON_BIN=""
-for cand in python3 python /opt/miniconda3/envs/testbed/bin/python /opt/miniconda3/bin/python /usr/bin/python3 /usr/bin/python; do
+for cand in \
+    /codex_setup/codex/python/bin/python3 \
+    /codex_setup/codex/python/bin/python3.12 \
+    python3 \
+    python \
+    /opt/miniconda3/envs/testbed/bin/python \
+    /opt/miniconda3/bin/python \
+    /usr/bin/python3 \
+    /usr/bin/python; do
     if command -v "$cand" >/dev/null 2>&1 || [ -x "$cand" ]; then
         # Sanity check: must be Python 3.
         if "$cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3,7) else 1)' 2>/dev/null; then
@@ -86,7 +95,7 @@ for cand in python3 python /opt/miniconda3/envs/testbed/bin/python /opt/minicond
     fi
 done
 if [ -z "$PYTHON_BIN" ]; then
-    echo "ERROR: no Python 3 interpreter found on PATH or in conda paths" >&2
+    echo "ERROR: no Python 3 interpreter found (bundled or system)" >&2
     exit 72
 fi
 echo "Using PYTHON_BIN=$PYTHON_BIN ($("$PYTHON_BIN" --version 2>&1))"
