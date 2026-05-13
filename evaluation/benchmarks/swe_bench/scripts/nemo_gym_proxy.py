@@ -175,46 +175,191 @@ def _sse_event(event_type: str, data_obj: object) -> bytes:
 def _synthesize_responses_sse(response_obj: dict[str, object]) -> bytes:
     """Build an SSE event stream that mirrors what codex would have read.
 
-    Codex's Responses-API stream parser walks the events to assemble the final
-    `Response`. The minimum-viable sequence for a complete, non-streamed
-    response is `response.created` followed by `response.completed`, each
-    carrying the full Response object. Codex's parser tolerates the missing
-    intermediate `response.output_*` deltas as long as `response.completed`
-    contains the assembled `output` array.
+    Codex's Responses-API stream parser doesn't just look at `response.completed`
+    — it dispatches tool calls based on the per-item events (`output_item.added`,
+    `function_call_arguments.done`, `output_item.done`). A 2-event synth
+    (`response.created` + `response.completed`) made codex see the final
+    response but never invoke the function_calls inside — turns ended at
+    turn=0 with no tool dispatch, every rollout came out 1-turn / empty-patch.
 
-    We emit:
-      event: response.created       data: {type, sequence_number, response}
-      event: response.completed     data: {type, sequence_number, response}
-
-    `response_obj` has a `status` field from the gym ("completed" usually);
-    we surface that as-is. If absent, we set "completed" on the second event.
+    Proper synth: emit the full intermediate sequence so codex's per-item
+    handlers fire. For each output item:
+      * response.output_item.added
+      * (function_call): response.function_call_arguments.delta + .done
+      * (message):       response.content_part.added,
+                         response.output_text.delta + .done,
+                         response.content_part.done
+      * (reasoning):     response.reasoning_text.delta + .done,
+                         response.reasoning_summary_text.delta + .done
+      * response.output_item.done
+    Then finish with response.completed carrying the full Response.
     """
-    # Make sure the response is marked completed on the final event regardless
-    # of what the gym sent.
+    seq = [0]
+
+    def evt(event_type: str, payload: dict[str, object]) -> bytes:
+        payload = {"type": event_type, "sequence_number": seq[0], **payload}
+        seq[0] += 1
+        return _sse_event(event_type, payload)
+
     completed_response = dict(response_obj)
     completed_response.setdefault("status", "completed")
+    # "in progress" version of the response for the `created` event — same shape
+    # but without the output items materialized yet, status="in_progress".
+    in_progress_response = {
+        **{k: v for k, v in response_obj.items() if k != "output"},
+        "status": "in_progress",
+        "output": [],
+    }
 
     parts: list[bytes] = []
-    parts.append(
-        _sse_event(
-            "response.created",
-            {
-                "type": "response.created",
-                "sequence_number": 0,
-                "response": response_obj,
-            },
+    parts.append(evt("response.created", {"response": in_progress_response}))
+    parts.append(evt("response.in_progress", {"response": in_progress_response}))
+
+    output = response_obj.get("output") or []
+    if not isinstance(output, list):
+        output = []
+
+    for idx, item in enumerate(output):
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("id") or f"item_{idx}"
+        item_type = item.get("type")
+
+        parts.append(
+            evt("response.output_item.added", {"output_index": idx, "item": item})
         )
-    )
-    parts.append(
-        _sse_event(
-            "response.completed",
-            {
-                "type": "response.completed",
-                "sequence_number": 1,
-                "response": completed_response,
-            },
+
+        if item_type == "function_call":
+            args = item.get("arguments") or ""
+            if not isinstance(args, str):
+                try:
+                    args = json.dumps(args, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    args = ""
+            # Emit the whole args string as a single "delta" then "done". Codex
+            # buffers deltas until `done` so a single delta is fine.
+            parts.append(
+                evt(
+                    "response.function_call_arguments.delta",
+                    {"item_id": item_id, "output_index": idx, "delta": args},
+                )
+            )
+            parts.append(
+                evt(
+                    "response.function_call_arguments.done",
+                    {"item_id": item_id, "output_index": idx, "arguments": args},
+                )
+            )
+        elif item_type == "message":
+            content = item.get("content") or []
+            if not isinstance(content, list):
+                content = []
+            for cidx, part in enumerate(content):
+                if not isinstance(part, dict):
+                    continue
+                ptype = part.get("type")
+                if ptype in ("output_text", "text"):
+                    text = part.get("text") or ""
+                    parts.append(
+                        evt(
+                            "response.content_part.added",
+                            {
+                                "item_id": item_id,
+                                "output_index": idx,
+                                "content_index": cidx,
+                                "part": part,
+                            },
+                        )
+                    )
+                    parts.append(
+                        evt(
+                            "response.output_text.delta",
+                            {
+                                "item_id": item_id,
+                                "output_index": idx,
+                                "content_index": cidx,
+                                "delta": text,
+                            },
+                        )
+                    )
+                    parts.append(
+                        evt(
+                            "response.output_text.done",
+                            {
+                                "item_id": item_id,
+                                "output_index": idx,
+                                "content_index": cidx,
+                                "text": text,
+                            },
+                        )
+                    )
+                    parts.append(
+                        evt(
+                            "response.content_part.done",
+                            {
+                                "item_id": item_id,
+                                "output_index": idx,
+                                "content_index": cidx,
+                                "part": part,
+                            },
+                        )
+                    )
+        elif item_type == "reasoning":
+            # Codex's reasoning items have a `summary` list of text blocks.
+            for sidx, s in enumerate((item.get("summary") or [])):
+                if not isinstance(s, dict):
+                    continue
+                stext = s.get("text") or ""
+                parts.append(
+                    evt(
+                        "response.reasoning_summary_part.added",
+                        {
+                            "item_id": item_id,
+                            "output_index": idx,
+                            "summary_index": sidx,
+                            "part": s,
+                        },
+                    )
+                )
+                parts.append(
+                    evt(
+                        "response.reasoning_summary_text.delta",
+                        {
+                            "item_id": item_id,
+                            "output_index": idx,
+                            "summary_index": sidx,
+                            "delta": stext,
+                        },
+                    )
+                )
+                parts.append(
+                    evt(
+                        "response.reasoning_summary_text.done",
+                        {
+                            "item_id": item_id,
+                            "output_index": idx,
+                            "summary_index": sidx,
+                            "text": stext,
+                        },
+                    )
+                )
+                parts.append(
+                    evt(
+                        "response.reasoning_summary_part.done",
+                        {
+                            "item_id": item_id,
+                            "output_index": idx,
+                            "summary_index": sidx,
+                            "part": s,
+                        },
+                    )
+                )
+
+        parts.append(
+            evt("response.output_item.done", {"output_index": idx, "item": item})
         )
-    )
+
+    parts.append(evt("response.completed", {"response": completed_response}))
     return b"".join(parts)
 
 
